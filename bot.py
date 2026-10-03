@@ -8,6 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.types import FSInputFile
+from aiogram.exceptions import TelegramBadRequest
 from analytics import generate_statistics
 from ai_module import analyze_english_text
 
@@ -33,6 +34,21 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True,
     input_field_placeholder="Оберіть дію в меню..."
 )
+
+def get_daily_usage(user_id):
+    conn = sqlite3.connect('english_practice.db')
+    cursor = conn.cursor()
+    
+    # Використовуємо правильну назву колонки "date" з твоєї таблиці
+    cursor.execute('''
+        SELECT COUNT(id) 
+        FROM submissions 
+        WHERE user_id = ? AND date("date") = date('now', 'localtime')
+    ''', (user_id,))
+    
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
 
 def save_to_db(user_id, original_text, analysis):
     """Функція для збереження тексту та деталей помилок у базу даних"""
@@ -144,13 +160,28 @@ async def btn_statistics(message: types.Message, state: FSMContext):
 # Цей хендлер спрацює ТІЛЬКИ якщо бот перебуває у стані waiting_for_text
 @dp.message(BotStates.waiting_for_text)
 async def handle_text(message: types.Message, state: FSMContext):
+    # --- БЛОК ПЕРЕВІРКИ ЛІМІТУ ---
+    daily_used = get_daily_usage(message.from_user.id)
+    if daily_used >= 10:
+        await message.answer(
+            "🛑 <b>Денний ліміт вичерпано!</b>\n\n"
+            "Ти вже перевірив 10 текстів за сьогодні. Щоб не перевищити ліміти API, повертайся завтра!", 
+            parse_mode="HTML"
+        )
+        await state.clear() # Скидаємо стан, щоб користувач міг тиснути інші кнопки
+        return
+    # -----------------------------
+
     processing_msg = await message.answer("🔄 Аналізую текст...")
     
     analysis = analyze_english_text(message.text)
     
     if not analysis:
-        await processing_msg.edit_text("❌ Виникла помилка при зверненні до нейромережі. Спробуй ще раз.")
-        # Залишаємо в режимі очікування, щоб можна було відправити текст повторно
+        try:
+            await processing_msg.edit_text("❌ Виникла помилка при зверненні до нейромережі. Спробуй ще раз.")
+        except TelegramBadRequest:
+            pass
+            
         return
     
     save_to_db(message.from_user.id, message.text, analysis)
@@ -180,13 +211,29 @@ async def handle_text(message: types.Message, state: FSMContext):
     else:
         response_text += "🎉 Чудова робота! Помилок не знайдено."
         
-    await processing_msg.edit_text(response_text, parse_mode="HTML")
+    # Захищаємо фінальний вивід від помилки TelegramBadRequest
+    try:
+        await processing_msg.edit_text(response_text, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
     
     # Виходимо з режиму очікування, щоб користувач знову міг користуватися меню
     await state.clear()
 
 @dp.message(BotStates.waiting_for_level_check)
 async def handle_level_check(message: types.Message, state: FSMContext):
+    # --- БЛОК ПЕРЕВІРКИ ЛІМІТУ ---
+    daily_used = get_daily_usage(message.from_user.id)
+    if daily_used >= 10:
+        await message.answer(
+            "🛑 <b>Денний ліміт вичерпано!</b>\n\n"
+            "Ти вже використав 10 перевірок за сьогодні. Щоб не перевищити ліміти API, повертайся завтра!", 
+            parse_mode="HTML"
+        )
+        await state.clear() 
+        return
+    # -----------------------------
+
     word_count = len(message.text.split())
     
     # Відсікаємо занадто короткі тексти
@@ -201,7 +248,10 @@ async def handle_level_check(message: types.Message, state: FSMContext):
     
     analysis = analyze_english_text(message.text)
     if not analysis:
-        await processing_msg.edit_text("❌ Виникла помилка при зверненні до нейромережі. Спробуй ще раз.")
+        try:
+            await processing_msg.edit_text("❌ Виникла помилка при зверненні до нейромережі. Спробуй ще раз.")
+        except TelegramBadRequest:
+            pass
         return
         
     save_to_db(message.from_user.id, message.text, analysis)
@@ -222,19 +272,16 @@ async def handle_level_check(message: types.Message, state: FSMContext):
     # ЗБЕРІГАЄМО помилки, виправлений текст І сам звіт у пам'ять бота
     await state.update_data(errors=errors, corrected=corrected, summary=summary_text)
     
-    # Створюємо інлайн-кнопку
+    # Створюємо інлайн-кнопку (тільки один раз!)
     inline_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👀 Подивитися помилки", callback_data="show_errors")]
     ])
     
-    await processing_msg.edit_text(summary_text, reply_markup=inline_kb, parse_mode="HTML")
-    
-    # Створюємо інлайн-кнопку
-    inline_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👀 Подивитися помилки", callback_data="show_errors")]
-    ])
-    
-    await processing_msg.edit_text(summary_text, reply_markup=inline_kb, parse_mode="HTML")
+    try:
+        await processing_msg.edit_text(summary_text, reply_markup=inline_kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+        
     # Знімаємо стан, але НЕ очищуємо дані, щоб кнопка змогла їх дістати
     await state.set_state(None)
 

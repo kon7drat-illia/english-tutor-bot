@@ -7,9 +7,12 @@ from datetime import datetime, timedelta
 import requests
 from dotenv import load_dotenv
 import time
+from anthropic import Anthropic
+import matplotlib as mpl
 
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
+
+client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 def generate_statistics(user_id):
     conn = sqlite3.connect('english_practice.db')
@@ -71,9 +74,9 @@ def generate_statistics(user_id):
     days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
     heatmap_data = heatmap_data.reindex(days_order)
 
-    annot_data = heatmap_data.applymap(lambda x: str(int(x)) if x > 0 else "")
+    annot_data = heatmap_data.map(lambda x: str(int(x)) if x > 0 else "")
     
-    cmap = plt.cm.get_cmap('cool').copy()
+    cmap = mpl.colormaps['cool'].copy()
     cmap.set_under(CELL_EMPTY_COLOR)
 
     sns.heatmap(heatmap_data, cmap=cmap, vmin=0.1, linewidths=5, linecolor=BORDER_COLOR, 
@@ -133,7 +136,7 @@ def generate_statistics(user_id):
         for spine in ax2.spines.values():
             spine.set_visible(False)
     else:
-        ax2.text(0.5, 0.5, "Немає помилок за цей тиждень! 🎉", ha='center', va='center', fontsize=16, color=TEXT_COLOR)
+        ax2.text(0.5, 0.5, "Немає помилок за цей тиждень!", ha='center', va='center', fontsize=16, color=TEXT_COLOR)
         ax2.axis('off')
 
     ax2.tick_params(axis='y', colors=TEXT_COLOR, length=0, labelsize=14)
@@ -153,62 +156,40 @@ def generate_statistics(user_id):
     ai_advice = get_ai_advice(df_error_details, sorted_categories)
     return image_path, ai_advice
 
-
 def get_ai_advice(df_details, sorted_categories):
     if df_details.empty or not sorted_categories:
         return "Твоя статистика ідеальна! Продовжуй практикувати письмо, дивитися фільми та читати англійською."
         
-    structured_errors_for_prompt = ""
+    structured_errors = ""
     for cat in sorted_categories:
         cat_errors = df_details[df_details['error_category'] == cat]['description'].tolist()
         if cat_errors:
-            structured_errors_for_prompt += f"[{cat}]\n"
+            structured_errors += f"[{cat}]\n"
             for err in list(set(cat_errors))[:5]:
-                structured_errors_for_prompt += f"- {err}\n"
-            structured_errors_for_prompt += "\n"
+                structured_errors += f"- {err}\n"
+            structured_errors += "\n"
     
     prompt = f"""
-    Ти викладач англійської мови. Ось помилки студента за тиждень, розбиті за категоріями:
-    
-    {structured_errors_for_prompt}
+    Ти викладач англійської мови. Ось помилки студента за тиждень по категоріях:
+    {structured_errors}
     
     Сформуй звіт.
-    ВАЖЛИВІ ПРАВИЛА (ВИКОНУВАТИ СУВОРО):
-    1. Збережи порядок категорій.
-    2. Заголовок кожного блоку має бути строго таким: Category_name (Переклад_українською):
-    3. Для блоку Grammar (Граматика) текст під заголовком має починатися з фрази "Вам варто повторити ці теми: ".
-    4. Для інших блоків текст має починатися з фрази "Зверніть увагу на ці випадки: " і далі списком короткі нагадування: [помилка] -> [правильно] (пояснення).
-    5. НЕ використовуй жодної markdown-розмітки.
-    6. Не пиши жодних вступних чи завершальних речень.
+    Вимоги:
+    1. Збережи порядок категорій. Скільки категорій передано — стільки ж блоків виведи.
+    2. Заголовок кожного блоку строго у форматі: Category_name (Переклад_українською):
+    3. Для блоку Grammar (Граматика) текст починай із: "Вам варто повторити ці теми: " і далі перелік.
+    4. Для решти блоків текст починай із: "Зверніть увагу на ці випадки: " і далі списком: [помилка] -> [правильно] (пояснення).
+    5. НЕ використовуй жодних зірочок (*) чи markdown. Тільки чистий текст.
+    6. Не пиши жодних вступів чи підсумків.
     """
     
-    data = {"contents": [{"parts": [{"text": prompt}]}]}
-    
-    # --- КАСКАДНА СИСТЕМА МОДЕЛЕЙ ---
-    # Бот спробує їх по черзі. Якщо одна зайнята (503), він одразу стукає в іншу.
-    models_to_try = [
-        "gemini-3.5-flash", # Найлегша і найшвидша модель, рідше всього буває перевантажена
-        "gemini-3.8-flash",    # Стандартна версія
-        "gemini-3.6-flash",    # Нова версія (якщо доступна)
-        "gemini-3.0-flash"       # Важка модель (на крайній випадок)
-    ]
-    
-    for model_name in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={API_KEY}"
-        
-        try:
-            resp = requests.post(url, headers={'Content-Type': 'application/json'}, json=data)
-            
-            if resp.status_code == 200:
-                # Успіх! Повертаємо текст і виходимо з функції
-                return resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-            else:
-                print(f"[AI] Модель {model_name} зайнята або недоступна. Код: {resp.status_code}. Пробуємо наступну...")
-                continue # Переходимо до наступної моделі в списку
-                
-        except Exception as e:
-            print(f"[AI] Збій при зверненні до {model_name}: {e}")
-            continue
-            
-    # Якщо ЖОДНА з 4 моделей не відповіла (що буває вкрай рідко)
-    return "Графіки згенеровані! 📊\n(ШІ-порада тимчасово недоступна: глобальні сервери Google зараз повністю перевантажені)."
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"[CLAUDE ADVICE ERROR]: {e}")
+        return "Графіки згенеровані! (Порада тимчасово недоступна)."
