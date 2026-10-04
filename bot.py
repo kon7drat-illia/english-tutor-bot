@@ -10,7 +10,8 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.types import FSInputFile
 from aiogram.exceptions import TelegramBadRequest
 from analytics import generate_statistics
-from ai_module import analyze_english_text
+from ai_module import analyze_english_text, generate_topic_suggestions
+from aiogram import BaseMiddleware
 
 # Завантажуємо змінні оточення
 load_dotenv()
@@ -49,6 +50,39 @@ def get_daily_usage(user_id):
     count = cursor.fetchone()[0]
     conn.close()
     return count
+
+# Чорний список (сюди вписуєш ID тих, кого хочеш заблокувати, через кому)
+BANNED_USERS = [] 
+
+class BanMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        # Перевіряємо, чи є ID відправника у чорному списку
+        if event.from_user.id in BANNED_USERS:
+            # Якщо так — просто зупиняємо обробку (бот промовчить)
+            # Можна розкоментувати рядок нижче, щоб бот щось відповідав:
+            # await event.answer("🚫 Доступ до бота заблоковано.")
+            return 
+            
+        # Якщо користувача немає в списку — пропускаємо його далі
+        return await handler(event, data)
+
+# "Ставимо охоронця на двері" — реєструємо Middleware для всіх повідомлень
+dp.message.middleware(BanMiddleware())
+
+def get_user_recent_texts(user_id, limit=5):
+    """Дістає останні тексти користувача для розуміння його інтересів"""
+    conn = sqlite3.connect('english_practice.db')
+    cursor = conn.cursor()
+    # Беремо тексти, відсортовані за часом створення (найновіші)
+    cursor.execute('''
+        SELECT original_text 
+        FROM submissions 
+        WHERE user_id = ? 
+        ORDER BY created_at DESC LIMIT ?
+    ''', (user_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 def save_to_db(user_id, original_text, analysis):
     """Функція для збереження тексту та деталей помилок у базу даних"""
@@ -104,10 +138,24 @@ def save_to_db(user_id, original_text, analysis):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear() # Скидаємо стани, якщо вони були
+    await state.clear() # Скидаємо стани
+    
+    welcome_text = (
+        "Привіт! 👋 Я твій персональний AI-асистент з англійської мови.\n\n"
+        "<b>Ось що я вмію:</b>\n"
+        "📝 <b>Написати текст</b> — виправлю твої помилки та поясню граматику.\n"
+        "🎯 <b>Перевірити рівень</b> — напиши від 80 слів, і я визначу твій рівень.\n"
+        "💡 <b>Запропонувати тему</b> — підберу цікаві ідеї для твоєї практики.\n"
+        "📊 <b>Моя статистика</b> — покажу твій прогрес та часті помилки.\n\n"
+        "⚠️ <b>Важливо:</b> Для захисту від перевантажень у тебе є ліміт — <b>10 перевірок текстів на день</b>. "
+        "Він оновлюється щодня опівночі.\n\n"
+        "Обирай дію в меню нижче і почнемо! 👇"
+    )
+    
     await message.answer(
-        "Привіт! Я твій AI-асистент з англійської. Обирай дію в меню нижче 👇",
-        reply_markup=main_kb
+        welcome_text,
+        reply_markup=main_kb,
+        parse_mode="HTML"
     )
 
 # --- ОБРОБКА КНОПОК МЕНЮ ---
@@ -130,7 +178,73 @@ async def btn_check_level(message: types.Message, state: FSMContext):
 @dp.message(F.text == "💡 Запропонувати тему")
 async def btn_suggest_topic(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Ця функція на стадії розробки (Етап 5). Скоро бот навчиться підбирати теми персонально для тебе!")
+    processing_msg = await message.answer("🔄 Аналізую твої інтереси та підбираю цікаві теми...")
+    
+    # Дістаємо останні тексти з бази
+    past_texts = get_user_recent_texts(message.from_user.id)
+    
+    # Генеруємо теми
+    topics = generate_topic_suggestions(past_texts)
+    
+    if not topics or len(topics) != 4:
+        try:
+            await processing_msg.edit_text("❌ Виникла помилка при генерації тем. Спробуй ще раз.")
+        except TelegramBadRequest:
+            pass
+        return
+        
+    # Зберігаємо згенеровані теми у тимчасову пам'ять (FSM)
+    await state.update_data(suggested_topics=topics)
+    
+    # Створюємо 4 кнопки. У callback_data передаємо просто індекс теми (0, 1, 2, 3)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"1️⃣ {topics[0]['title']}", callback_data="topic_0")],
+        [InlineKeyboardButton(text=f"2️⃣ {topics[1]['title']}", callback_data="topic_1")],
+        [InlineKeyboardButton(text=f"3️⃣ {topics[2]['title']}", callback_data="topic_2")],
+        [InlineKeyboardButton(text=f"4️⃣ {topics[3]['title']}", callback_data="topic_3")]
+    ])
+    
+    try:
+        await processing_msg.edit_text(
+            "Ось 4 теми для тебе (частина з них базується на твоїх попередніх текстах). Обери ту, яка найбільше до душі:", 
+            reply_markup=kb
+        )
+    except TelegramBadRequest:
+        pass
+
+# Хендлер, який спрацьовує, коли користувач тисне на одну з тем
+@dp.callback_query(F.data.startswith("topic_"))
+async def process_topic_selection(callback: CallbackQuery, state: FSMContext):
+    # Дістаємо індекс вибраної теми з callback_data (наприклад, з "topic_2" дістанемо 2)
+    topic_index = int(callback.data.split("_")[1])
+    
+    # Дістаємо збережені теми з пам'яті
+    data = await state.get_data()
+    topics = data.get("suggested_topics", [])
+    
+    if not topics:
+        await callback.answer("Дані застаріли. Згенеруй теми ще раз.", show_alert=True)
+        return
+        
+    selected_topic = topics[topic_index]
+    title = selected_topic.get("title", "Тема")
+    questions = selected_topic.get("questions", "Опиши свої думки на цю тему.")
+    
+    prompt_text = (
+        f"🎯 <b>Класний вибір!</b>\n\n"
+        f"<b>Тема:</b> {title}\n\n"
+        f"💡 <b>Щоб тобі було легше почати, ось кілька питань-підказок:</b>\n"
+        f"<i>{questions}</i>\n\n"
+        f"📝 Чекаю на твій текст англійською!"
+    )
+    
+    # Оновлюємо повідомлення (прибираємо кнопки і показуємо питання)
+    await callback.message.edit_text(prompt_text, reply_markup=None, parse_mode="HTML")
+    await callback.answer()
+    
+    # А тепер головне: переводимо бота у стан очікування тексту! 
+    # Коли ти напишеш текст, спрацює твій стандартний handle_text
+    await state.set_state(BotStates.waiting_for_text)
 
 @dp.message(F.text == "📊 Моя статистика")
 async def btn_statistics(message: types.Message, state: FSMContext):
@@ -160,6 +274,9 @@ async def btn_statistics(message: types.Message, state: FSMContext):
 # Цей хендлер спрацює ТІЛЬКИ якщо бот перебуває у стані waiting_for_text
 @dp.message(BotStates.waiting_for_text)
 async def handle_text(message: types.Message, state: FSMContext):
+
+    print(f"👀 Текст на перевірку надіслав користувач з ID: {message.from_user.id}")
+
     # --- БЛОК ПЕРЕВІРКИ ЛІМІТУ ---
     daily_used = get_daily_usage(message.from_user.id)
     if daily_used >= 10:
