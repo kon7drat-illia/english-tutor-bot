@@ -36,55 +36,54 @@ main_kb = ReplyKeyboardMarkup(
     input_field_placeholder="Оберіть дію в меню..."
 )
 
-def get_ai_limit(user_id):
-    """Перевіряє, скільки запитів користувач вже зробив сьогодні"""
+def get_feature_limit(user_id, feature_name):
+    """Перевіряє, скільки запитів для конкретної фічі користувач зробив сьогодні"""
     conn = sqlite3.connect('english_practice.db')
     cursor = conn.cursor()
     
-    # Створюємо таблицю лімітів, якщо її ще немає
+    # Створюємо нову таблицю для лімітів по категоріях, якщо її ще немає
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS api_usage (
+        CREATE TABLE IF NOT EXISTS feature_usage (
             user_id INTEGER,
+            feature_name TEXT,
             usage_date DATE,
             requests_count INTEGER,
-            UNIQUE(user_id, usage_date)
+            UNIQUE(user_id, feature_name, usage_date)
         )
     ''')
     
     cursor.execute('''
-        SELECT requests_count FROM api_usage 
-        WHERE user_id = ? AND usage_date = date("now")
-    ''', (user_id,))
+        SELECT requests_count FROM feature_usage 
+        WHERE user_id = ? AND feature_name = ? AND usage_date = date("now")
+    ''', (user_id, feature_name))
     
     row = cursor.fetchone()
     conn.close()
     
     return row[0] if row else 0
 
-def increment_ai_limit(user_id):
-    """Збільшує лічильник запитів на 1"""
+def increment_feature_limit(user_id, feature_name):
+    """Збільшує лічильник запитів конкретної фічі на 1"""
     conn = sqlite3.connect('english_practice.db')
     cursor = conn.cursor()
     
     cursor.execute('''
-        SELECT requests_count FROM api_usage 
-        WHERE user_id = ? AND usage_date = date("now")
-    ''', (user_id,))
+        SELECT requests_count FROM feature_usage 
+        WHERE user_id = ? AND feature_name = ? AND usage_date = date("now")
+    ''', (user_id, feature_name))
     row = cursor.fetchone()
     
     if row:
-        # Якщо сьогодні вже були запити, додаємо +1
         cursor.execute('''
-            UPDATE api_usage 
+            UPDATE feature_usage 
             SET requests_count = requests_count + 1 
-            WHERE user_id = ? AND usage_date = date("now")
-        ''', (user_id,))
+            WHERE user_id = ? AND feature_name = ? AND usage_date = date("now")
+        ''', (user_id, feature_name))
     else:
-        # Якщо це перший запит за день, створюємо запис
         cursor.execute('''
-            INSERT INTO api_usage (user_id, usage_date, requests_count) 
-            VALUES (?, date("now"), 1)
-        ''', (user_id,))
+            INSERT INTO feature_usage (user_id, feature_name, usage_date, requests_count) 
+            VALUES (?, ?, date("now"), 1)
+        ''', (user_id, feature_name))
         
     conn.commit()
     conn.close()
@@ -181,11 +180,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
     welcome_text = (
         "Привіт! 👋 Я твій персональний AI-асистент з англійської мови.\n\n"
         "<b>Ось що я вмію:</b>\n"
-        "📝 <b>Написати текст</b> — виправлю твої помилки та поясню граматику.\n"
-        "🎯 <b>Перевірити рівень</b> — напиши від 80 слів, і я визначу твій рівень.\n"
-        "💡 <b>Запропонувати тему</b> — підберу цікаві ідеї для твоєї практики.\n"
-        "📊 <b>Моя статистика</b> — покажу твій прогрес та часті помилки.\n\n"
-        "⚠️ <b>Важливо:</b> Для захисту від перевантажень у тебе є ліміт — <b>10 перевірок текстів на день</b>. "
+        "📝 <b>Написати текст (5)</b> — виправлю твої помилки та поясню граматику.\n"
+        "🎯 <b>Перевірити рівень (3)</b> — напиши від 80 слів, і я визначу твій рівень.\n"
+        "💡 <b>Запропонувати тему (5)</b> — підберу цікаві ідеї для твоєї практики.\n"
+        "📊 <b>Моя статистика (3)</b> — покажу твій прогрес та часті помилки.\n\n"
+        "⚠️ <b>Важливо:</b> В дужках вказані ліміти запитів на добу.\n"
         "Він оновлюється щодня опівночі.\n\n"
         "Обирай дію в меню нижче і почнемо! 👇"
     )
@@ -218,15 +217,15 @@ async def btn_check_level(message: types.Message, state: FSMContext):
 @dp.message(F.text == "💡 Запропонувати тему")
 async def btn_suggest_topic(message: types.Message, state: FSMContext):
 
-    # --- УНІВЕРСАЛЬНА ПЕРЕВІРКА ЛІМІТУ ---
-    if get_ai_limit(message.from_user.id) >= 10:
-        await message.answer("🛑 <b>Денний ліміт вичерпано (10/10)!</b>\nПовертайся завтра.", parse_mode="HTML")
+    # --- ПЕРЕВІРКА ЛІМІТУ ДЛЯ ІНШИХ ЗАВДАНЬ (5 на день) ---
+    current_usage = get_feature_limit(message.from_user.id, "suggest_topic")
+    if current_usage >= 5:
+        await message.answer("🛑 <b>Денний ліміт запитів вичерпано (5/5)!</b>\nПовертайся завтра.", parse_mode="HTML")
         await state.clear()
         return
         
-    # Якщо ліміт є, одразу списуємо 1 спробу
-    increment_ai_limit(message.from_user.id)
-    # ------------------------------------
+    increment_feature_limit(message.from_user.id, "suggest_topic")
+    # --------------------------------
 
     await state.clear()
     processing_msg = await message.answer("🔄 Аналізую твої інтереси та підбираю цікаві теми...")
@@ -300,14 +299,14 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext):
 @dp.message(F.text == "📊 Моя статистика")
 async def btn_statistics(message: types.Message, state: FSMContext):
 
-    # --- УНІВЕРСАЛЬНА ПЕРЕВІРКА ЛІМІТУ ---
-    if get_ai_limit(message.from_user.id) >= 10:
-        await message.answer("🛑 <b>Денний ліміт вичерпано (10/10)!</b>\nПовертайся завтра.", parse_mode="HTML")
+    # --- ПЕРЕВІРКА ЛІМІТУ ДЛЯ СТАТИСТИКИ (3 на день) ---
+    current_usage = get_feature_limit(message.from_user.id, "statistics")
+    if current_usage >= 3:
+        await message.answer("🛑 <b>Денний ліміт на статистику вичерпано (3/3)!</b>\nПовертайся завтра.", parse_mode="HTML")
         await state.clear()
         return
         
-    # Якщо ліміт є, одразу списуємо 1 спробу
-    increment_ai_limit(message.from_user.id)
+    increment_feature_limit(message.from_user.id, "statistics")
     # --------------------------------
 
     await state.clear()
@@ -356,15 +355,15 @@ async def btn_statistics(message: types.Message, state: FSMContext):
 @dp.message(BotStates.waiting_for_text)
 async def handle_text(message: types.Message, state: FSMContext):
 
-    # --- УНІВЕРСАЛЬНА ПЕРЕВІРКА ЛІМІТУ ---
-    if get_ai_limit(message.from_user.id) >= 10:
-        await message.answer("🛑 <b>Денний ліміт вичерпано (10/10)!</b>\nПовертайся завтра.", parse_mode="HTML")
+# --- ПЕРЕВІРКА ЛІМІТУ ДЛЯ ІНШИХ ЗАВДАНЬ (5 на день) ---
+    current_usage = get_feature_limit(message.from_user.id, "text_check")
+    if current_usage >= 5:
+        await message.answer("🛑 <b>Денний ліміт запитів вичерпано (5/5)!</b>\nПовертайся завтра.", parse_mode="HTML")
         await state.clear()
         return
         
-    # Якщо ліміт є, одразу списуємо 1 спробу
-    increment_ai_limit(message.from_user.id)
-    # ------------------------------------
+    increment_feature_limit(message.from_user.id, "text_check")
+# --------------------------------
 
     print(f"👀 Текст на перевірку надіслав користувач з ID: {message.from_user.id}")
 
@@ -419,15 +418,15 @@ async def handle_text(message: types.Message, state: FSMContext):
 @dp.message(BotStates.waiting_for_level_check)
 async def handle_level_check(message: types.Message, state: FSMContext):
 
-    # --- УНІВЕРСАЛЬНА ПЕРЕВІРКА ЛІМІТУ ---
-    if get_ai_limit(message.from_user.id) >= 10:
-        await message.answer("🛑 <b>Денний ліміт вичерпано (10/10)!</b>\nПовертайся завтра.", parse_mode="HTML")
+# --- ПЕРЕВІРКА ЛІМІТУ ДЛЯ ІНШИХ ЗАВДАНЬ (3 на день) ---
+    current_usage = get_feature_limit(message.from_user.id, "level_check")
+    if current_usage >= 3:
+        await message.answer("🛑 <b>Денний ліміт запитів вичерпано (3/3)!</b>\nПовертайся завтра.", parse_mode="HTML")
         await state.clear()
         return
         
-    # Якщо ліміт є, одразу списуємо 1 спробу
-    increment_ai_limit(message.from_user.id)
-    # ------------------------------------
+    increment_feature_limit(message.from_user.id, "level_check")
+# --------------------------------
 
     word_count = len(message.text.split())
     
