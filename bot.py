@@ -36,20 +36,58 @@ main_kb = ReplyKeyboardMarkup(
     input_field_placeholder="Оберіть дію в меню..."
 )
 
-def get_daily_usage(user_id):
+def get_ai_limit(user_id):
+    """Перевіряє, скільки запитів користувач вже зробив сьогодні"""
     conn = sqlite3.connect('english_practice.db')
     cursor = conn.cursor()
     
-    # Використовуємо правильну назву колонки "date" з твоєї таблиці
+    # Створюємо таблицю лімітів, якщо її ще немає
     cursor.execute('''
-        SELECT COUNT(id) 
-        FROM submissions 
-        WHERE user_id = ? AND date("date") = date('now', 'localtime')
+        CREATE TABLE IF NOT EXISTS api_usage (
+            user_id INTEGER,
+            usage_date DATE,
+            requests_count INTEGER,
+            UNIQUE(user_id, usage_date)
+        )
+    ''')
+    
+    cursor.execute('''
+        SELECT requests_count FROM api_usage 
+        WHERE user_id = ? AND usage_date = date("now")
     ''', (user_id,))
     
-    count = cursor.fetchone()[0]
+    row = cursor.fetchone()
     conn.close()
-    return count
+    
+    return row[0] if row else 0
+
+def increment_ai_limit(user_id):
+    """Збільшує лічильник запитів на 1"""
+    conn = sqlite3.connect('english_practice.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT requests_count FROM api_usage 
+        WHERE user_id = ? AND usage_date = date("now")
+    ''', (user_id,))
+    row = cursor.fetchone()
+    
+    if row:
+        # Якщо сьогодні вже були запити, додаємо +1
+        cursor.execute('''
+            UPDATE api_usage 
+            SET requests_count = requests_count + 1 
+            WHERE user_id = ? AND usage_date = date("now")
+        ''', (user_id,))
+    else:
+        # Якщо це перший запит за день, створюємо запис
+        cursor.execute('''
+            INSERT INTO api_usage (user_id, usage_date, requests_count) 
+            VALUES (?, date("now"), 1)
+        ''', (user_id,))
+        
+    conn.commit()
+    conn.close()
 
 # Чорний список (сюди вписуєш ID тих, кого хочеш заблокувати, через кому)
 BANNED_USERS = [] 
@@ -162,12 +200,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "📝 Написати текст")
 async def btn_write_text(message: types.Message, state: FSMContext):
+    
     await message.answer("Відправ мені свій текст англійською, і я перевірю його на помилки!")
     # Переводимо бота в режим очікування тексту
     await state.set_state(BotStates.waiting_for_text)
 
 @dp.message(F.text == "🎯 Перевірити рівень")
 async def btn_check_level(message: types.Message, state: FSMContext):
+    
     await message.answer(
         "Напиши текст англійською (мінімум 80 слів) про те, як пройшов твій день, або на будь-яку іншу тему. "
         "Я проаналізую його і визначу твій рівень!"
@@ -177,6 +217,17 @@ async def btn_check_level(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "💡 Запропонувати тему")
 async def btn_suggest_topic(message: types.Message, state: FSMContext):
+
+    # --- УНІВЕРСАЛЬНА ПЕРЕВІРКА ЛІМІТУ ---
+    if get_ai_limit(message.from_user.id) >= 10:
+        await message.answer("🛑 <b>Денний ліміт вичерпано (10/10)!</b>\nПовертайся завтра.", parse_mode="HTML")
+        await state.clear()
+        return
+        
+    # Якщо ліміт є, одразу списуємо 1 спробу
+    increment_ai_limit(message.from_user.id)
+    # ------------------------------------
+
     await state.clear()
     processing_msg = await message.answer("🔄 Аналізую твої інтереси та підбираю цікаві теми...")
     
@@ -248,6 +299,17 @@ async def process_topic_selection(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(F.text == "📊 Моя статистика")
 async def btn_statistics(message: types.Message, state: FSMContext):
+
+    # --- УНІВЕРСАЛЬНА ПЕРЕВІРКА ЛІМІТУ ---
+    if get_ai_limit(message.from_user.id) >= 10:
+        await message.answer("🛑 <b>Денний ліміт вичерпано (10/10)!</b>\nПовертайся завтра.", parse_mode="HTML")
+        await state.clear()
+        return
+        
+    # Якщо ліміт є, одразу списуємо 1 спробу
+    increment_ai_limit(message.from_user.id)
+    # --------------------------------
+
     await state.clear()
     processing_msg = await message.answer("🔄 Збираю аналітику, генерую графіки та поради від AI...")
     
@@ -258,11 +320,30 @@ async def btn_statistics(message: types.Message, state: FSMContext):
         await processing_msg.edit_text(ai_advice)
         return
         
-    # Відправляємо згенеровану картинку з графіками
     photo = FSInputFile(image_path)
-    caption = f"📊 <b>Твоя статистика</b>\n\n💡 <b>Порада від AI:</b>\n{ai_advice}"
     
-    await bot.send_photo(chat_id=message.chat.id, photo=photo, caption=caption, parse_mode="HTML")
+    # 1. Відправляємо лише фото з коротким підписом
+    await bot.send_photo(
+        chat_id=message.chat.id, 
+        photo=photo, 
+        caption="📊 <b>Твоя статистика</b>", 
+        parse_mode="HTML"
+    )
+
+    # --- ДОДАЄМО КЛАВІАТУРУ ТУТ ---
+    # Створюємо кнопку з твоїм посиланням на приватний канал
+    book_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📘 Відкрити підручник Murphy", url="https://t.me/c/4465513809/3")]
+    ])
+
+    # 2. Відправляємо розгорнуту пораду окремим текстовим повідомленням
+    await message.answer(
+        f"💡 <b>Порада від AI:</b>\n{ai_advice}", 
+        parse_mode="HTML",
+        reply_markup= book_kb
+    )
+    
+    # Видаляємо повідомлення "Збираю аналітику..."
     await processing_msg.delete()
     
     # Видаляємо картинку з комп'ютера, щоб не засмічувати пам'ять
@@ -275,19 +356,17 @@ async def btn_statistics(message: types.Message, state: FSMContext):
 @dp.message(BotStates.waiting_for_text)
 async def handle_text(message: types.Message, state: FSMContext):
 
-    print(f"👀 Текст на перевірку надіслав користувач з ID: {message.from_user.id}")
-
-    # --- БЛОК ПЕРЕВІРКИ ЛІМІТУ ---
-    daily_used = get_daily_usage(message.from_user.id)
-    if daily_used >= 10:
-        await message.answer(
-            "🛑 <b>Денний ліміт вичерпано!</b>\n\n"
-            "Ти вже перевірив 10 текстів за сьогодні. Щоб не перевищити ліміти API, повертайся завтра!", 
-            parse_mode="HTML"
-        )
-        await state.clear() # Скидаємо стан, щоб користувач міг тиснути інші кнопки
+    # --- УНІВЕРСАЛЬНА ПЕРЕВІРКА ЛІМІТУ ---
+    if get_ai_limit(message.from_user.id) >= 10:
+        await message.answer("🛑 <b>Денний ліміт вичерпано (10/10)!</b>\nПовертайся завтра.", parse_mode="HTML")
+        await state.clear()
         return
-    # -----------------------------
+        
+    # Якщо ліміт є, одразу списуємо 1 спробу
+    increment_ai_limit(message.from_user.id)
+    # ------------------------------------
+
+    print(f"👀 Текст на перевірку надіслав користувач з ID: {message.from_user.id}")
 
     processing_msg = await message.answer("🔄 Аналізую текст...")
     
@@ -339,17 +418,16 @@ async def handle_text(message: types.Message, state: FSMContext):
 
 @dp.message(BotStates.waiting_for_level_check)
 async def handle_level_check(message: types.Message, state: FSMContext):
-    # --- БЛОК ПЕРЕВІРКИ ЛІМІТУ ---
-    daily_used = get_daily_usage(message.from_user.id)
-    if daily_used >= 10:
-        await message.answer(
-            "🛑 <b>Денний ліміт вичерпано!</b>\n\n"
-            "Ти вже використав 10 перевірок за сьогодні. Щоб не перевищити ліміти API, повертайся завтра!", 
-            parse_mode="HTML"
-        )
-        await state.clear() 
+
+    # --- УНІВЕРСАЛЬНА ПЕРЕВІРКА ЛІМІТУ ---
+    if get_ai_limit(message.from_user.id) >= 10:
+        await message.answer("🛑 <b>Денний ліміт вичерпано (10/10)!</b>\nПовертайся завтра.", parse_mode="HTML")
+        await state.clear()
         return
-    # -----------------------------
+        
+    # Якщо ліміт є, одразу списуємо 1 спробу
+    increment_ai_limit(message.from_user.id)
+    # ------------------------------------
 
     word_count = len(message.text.split())
     
@@ -436,6 +514,8 @@ async def process_show_errors(callback: CallbackQuery, state: FSMContext):
 
 async def main():
     print("Бот запущений і чекає на повідомлення...")
+    # Ця команда видаляє чергу старих повідомлень
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
