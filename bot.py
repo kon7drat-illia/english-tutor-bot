@@ -332,7 +332,7 @@ async def btn_statistics(message: types.Message, state: FSMContext):
     # --- ДОДАЄМО КЛАВІАТУРУ ТУТ ---
     # Створюємо кнопку з твоїм посиланням на приватний канал
     book_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📘 Відкрити підручник Murphy", url="https://t.me/c/4465513809/3")]
+        [InlineKeyboardButton(text="📘 Відкрити підручник Murphy", url="https://t.me/english_bot2026")]
     ])
 
     # 2. Відправляємо розгорнуту пораду окремим текстовим повідомленням
